@@ -1,0 +1,370 @@
+
+ //@version=6
+strategy("Forex Pro Robot v3 - EMA + Wave + MACD + ADX",
+     shorttitle="Forex_Pro_V3",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     pyramiding=0,
+     commission_type=strategy.commission.percent,
+     commission_value=0.0,
+     slippage=2,
+     process_orders_on_close=true,
+     calc_on_order_fills=true)
+
+//====================================================
+// 1. CONFIGURAÇÕES GERAIS
+//====================================================
+
+groupGeneral = "1. Configurações gerais"
+
+tradeQty = input.float(1.0, "Quantidade por operação", minval=0.01, step=0.01, group=groupGeneral)
+allowLong = input.bool(true, "Permitir compras", group=groupGeneral)
+allowShort = input.bool(true, "Permitir vendas", group=groupGeneral)
+
+useSession = input.bool(true, "Ativar filtro de horário", group=groupGeneral)
+tradingSession = input.session("0300-1700", "Horário da operação", group=groupGeneral)
+sessionTimezone = input.string("Etc/UTC", "Fuso horário", group=groupGeneral)
+
+// O código funciona no timeframe do gráfico.
+// Recomendação de uso: 1h ou 4h.
+
+//====================================================
+// 2. MÉDIAS E WAVE 34
+//====================================================
+
+groupMA = "2. Médias móveis e Wave"
+
+emaFastLength = input.int(9, "EMA rápida", minval=1, group=groupMA)
+emaMidLength = input.int(21, "EMA intermediária", minval=1, group=groupMA)
+emaTrendLength = input.int(80, "EMA tendência", minval=1, group=groupMA)
+emaMajorLength = input.int(200, "EMA macro", minval=1, group=groupMA)
+waveLength = input.int(34, "Wave", minval=1, group=groupMA)
+
+ema9 = ta.ema(close, emaFastLength)
+ema21 = ta.ema(close, emaMidLength)
+ema80 = ta.ema(close, emaTrendLength)
+ema200 = ta.ema(close, emaMajorLength)
+
+waveHigh = ta.ema(high, waveLength)
+waveClose = ta.ema(close, waveLength)
+waveLow = ta.ema(low, waveLength)
+
+waveBull = waveClose > waveClose[1] and close > waveClose
+waveBear = waveClose < waveClose[1] and close < waveClose
+
+//====================================================
+// 3. MACD
+//====================================================
+
+groupMACD = "3. Filtro MACD"
+
+macdFast = input.int(12, "MACD rápido", minval=1, group=groupMACD)
+macdSlow = input.int(26, "MACD lento", minval=1, group=groupMACD)
+macdSignalLength = input.int(9, "MACD sinal", minval=1, group=groupMACD)
+
+[macdLine, macdSignal, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignalLength)
+
+macdBuy = macdLine > 0 and macdLine > macdSignal
+macdSell = macdLine < 0 and macdLine < macdSignal
+
+//====================================================
+// 4. ADX E DIREÇÃO DOS MOVIMENTOS
+//====================================================
+
+groupADX = "4. Filtro ADX"
+
+diLength = input.int(14, "DI período", minval=1, group=groupADX)
+adxSmoothing = input.int(14, "ADX suavização", minval=1, group=groupADX)
+adxMinimum = input.float(18.0, "ADX mínimo", minval=1, step=0.5, group=groupADX)
+requireAdxRising = input.bool(true, "Exigir ADX crescente", group=groupADX)
+
+[plusDI, minusDI, adxValue] = ta.dmi(diLength, adxSmoothing)
+
+adxStrong = adxValue >= adxMinimum
+adxRising = not requireAdxRising or adxValue > adxValue[1]
+
+adxBuy = adxStrong and adxRising and plusDI > minusDI
+adxSell = adxStrong and adxRising and minusDI > plusDI
+
+//====================================================
+// 5. FILTRO DE LATERALIZAÇÃO
+//====================================================
+
+groupSideways = "5. Filtro de lateralização"
+
+crossLookback = input.int(20, "Período para contar cruzamentos", minval=2, group=groupSideways)
+maxCrosses = input.int(3, "Máximo de cruzamentos permitidos", minval=0, group=groupSideways)
+
+useSeparationFilter = input.bool(true, "Exigir distância entre EMA 80 e 200", group=groupSideways)
+minSeparationPct = input.float(0.10, "Distância mínima EMA 80/200 (%)", minval=0, step=0.01, group=groupSideways)
+
+useSlopeFilter = input.bool(true, "Exigir inclinação da EMA 80", group=groupSideways)
+slopeLookback = input.int(5, "Período da inclinação", minval=1, group=groupSideways)
+minSlopePct = input.float(0.02, "Inclinação mínima EMA 80 (%)", minval=0, step=0.01, group=groupSideways)
+
+// Conta cruzamentos da EMA 9 com a EMA 21.
+crossEvent = ta.cross(ema9, ema21) ? 1.0 : 0.0
+crossCount = math.sum(crossEvent, crossLookback)
+
+isTooManyCrosses = crossCount > maxCrosses
+
+emaSeparationPct = math.abs(ema80 - ema200) / close * 100
+separationOK = not useSeparationFilter or emaSeparationPct >= minSeparationPct
+
+emaSlopePct = math.abs(ema80 - ema80[slopeLookback]) / close * 100
+slopeOK = not useSlopeFilter or emaSlopePct >= minSlopePct
+
+notSideways = not isTooManyCrosses and separationOK and slopeOK
+
+//====================================================
+// 6. SESSÃO DE OPERAÇÃO
+//====================================================
+
+inSession = not na(time(timeframe.period, tradingSession, sessionTimezone))
+sessionOK = not useSession or inSession
+
+//====================================================
+// 7. CÁLCULO DE PIPS
+//====================================================
+
+groupPips = "6. Stop, alvo e tamanho do pip"
+
+// Use 0 para cálculo automático.
+// Informe manualmente o tamanho do pip para CFDs,
+// metais ou símbolos com cotação diferente do Forex padrão.
+pipOverride = input.float(0.0, "Tamanho do pip (0 = automático)", minval=0, step=0.00001, group=groupPips)
+
+float autoPip = syminfo.mintick
+
+if syminfo.type == "forex"
+    if syminfo.currency == "JPY"
+        autoPip := syminfo.mintick <= 0.001 ? syminfo.mintick * 10 : syminfo.mintick
+    else
+        autoPip := syminfo.mintick <= 0.00001 ? syminfo.mintick * 10 : syminfo.mintick
+
+pipSize = pipOverride > 0 ? pipOverride : autoPip
+
+//====================================================
+// 8. GESTÃO DE RISCO
+//====================================================
+
+groupRisk = "7. Gestão de risco"
+
+stopPips = input.float(30, "Stop Loss (pips)", minval=0.1, step=0.1, group=groupRisk)
+targetPips = input.float(75, "Take Profit (pips)", minval=0.1, step=0.1, group=groupRisk)
+
+useDailyLossLimit = input.bool(true, "Ativar limite de perda diária", group=groupRisk)
+dailyLossCash = input.float(200, "Perda máxima diária (moeda da conta)", minval=1, step=1, group=groupRisk)
+
+maxTradesPerDay = input.int(5, "Máximo de entradas por dia", minval=1, group=groupRisk)
+
+// O limite diário é expresso na moeda da conta,
+// não em pips.
+strategy.risk.max_intraday_loss(
+     useDailyLossLimit ? dailyLossCash : 1000000000,
+     strategy.cash)
+
+// Contador de entradas do dia.
+var int tradesToday = 0
+
+newDay = ta.change(time("D")) != 0
+
+if newDay
+    tradesToday := 0
+
+canTradeToday = tradesToday < maxTradesPerDay
+
+//====================================================
+// 9. BREAK-EVEN E TRAILING STOP
+//====================================================
+
+groupManagement = "8. Break-even e trailing stop"
+
+useBreakEven = input.bool(true, "Ativar Break-even", group=groupManagement)
+breakEvenTrigger = input.float(20, "Ativar Break-even após (pips)", minval=0.1, group=groupManagement)
+breakEvenOffset = input.float(2, "Proteção do Break-even (pips)", minval=0, group=groupManagement)
+
+useTrailing = input.bool(true, "Ativar Trailing Stop", group=groupManagement)
+trailingStart = input.float(30, "Iniciar trailing após lucro (pips)", minval=0.1, group=groupManagement)
+atrLength = input.int(14, "ATR período", minval=1, group=groupManagement)
+atrMultiplier = input.float(2.0, "Multiplicador ATR", minval=0.1, step=0.1, group=groupManagement)
+
+atrValue = ta.atr(atrLength)
+
+stopDistance = stopPips * pipSize
+targetDistance = targetPips * pipSize
+
+beTriggerDistance = breakEvenTrigger * pipSize
+beOffsetDistance = breakEvenOffset * pipSize
+trailingStartDistance = trailingStart * pipSize
+
+// Variáveis persistentes para os stops.
+var float longStop = na
+var float shortStop = na
+
+var float longTarget = na
+var float shortTarget = na
+
+var float longPeak = na
+var float shortTrough = na
+
+var int longEntryBar = na
+var int shortEntryBar = na
+
+// Detecta a abertura de uma nova posição.
+newLongPosition = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShortPosition = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+// Inicialização da compra.
+if newLongPosition
+    longStop := strategy.position_avg_price - stopDistance
+    longTarget := strategy.position_avg_price + targetDistance
+    longPeak := strategy.position_avg_price
+    longEntryBar := bar_index
+
+// Inicialização da venda.
+if newShortPosition
+    shortStop := strategy.position_avg_price + stopDistance
+    shortTarget := strategy.position_avg_price - targetDistance
+    shortTrough := strategy.position_avg_price
+    shortEntryBar := bar_index
+
+// Atualização do stop da compra.
+if strategy.position_size > 0
+    entryPrice = strategy.position_avg_price
+    baseLongStop = entryPrice - stopDistance
+
+    // Não usa a máxima do candle de entrada.
+    if not na(longEntryBar) and bar_index > longEntryBar
+        longPeak := math.max(nz(longPeak, entryPrice), high)
+
+    favorableMoveLong = nz(longPeak, entryPrice) - entryPrice
+
+    beLongStop = useBreakEven and favorableMoveLong >= beTriggerDistance ?
+         entryPrice + beOffsetDistance : baseLongStop
+
+    trailLongStop = useTrailing and favorableMoveLong >= trailingStartDistance ?
+         nz(longPeak, entryPrice) - atrValue * atrMultiplier : baseLongStop
+
+    proposedLongStop = math.max(baseLongStop, math.max(beLongStop, trailLongStop))
+
+    // O stop da compra só pode subir, nunca recuar.
+    longStop := na(longStop) ? proposedLongStop : math.max(longStop, proposedLongStop)
+
+    strategy.exit("LONG EXIT", from_entry="LONG", stop=longStop, limit=longTarget)
+
+// Atualização do stop da venda.
+if strategy.position_size < 0
+    entryPrice = strategy.position_avg_price
+    baseShortStop = entryPrice + stopDistance
+
+    // Não usa a mínima do candle de entrada.
+    if not na(shortEntryBar) and bar_index > shortEntryBar
+        shortTrough := math.min(nz(shortTrough, entryPrice), low)
+
+    favorableMoveShort = entryPrice - nz(shortTrough, entryPrice)
+
+    beShortStop = useBreakEven and favorableMoveShort >= beTriggerDistance ?
+         entryPrice - beOffsetDistance : baseShortStop
+
+    trailShortStop = useTrailing and favorableMoveShort >= trailingStartDistance ?
+         nz(shortTrough, entryPrice) + atrValue * atrMultiplier : baseShortStop
+
+    proposedShortStop = math.min(baseShortStop, math.min(beShortStop, trailShortStop))
+
+    // O stop da venda só pode descer, nunca recuar.
+    shortStop := na(shortStop) ? proposedShortStop : math.min(shortStop, proposedShortStop)
+
+    strategy.exit("SHORT EXIT", from_entry="SHORT", stop=shortStop, limit=shortTarget)
+
+// Limpa os dados quando não há posição.
+if strategy.position_size == 0
+    longStop := na
+    shortStop := na
+    longTarget := na
+    shortTarget := na
+    longPeak := na
+    shortTrough := na
+    longEntryBar := na
+    shortEntryBar := na
+
+//====================================================
+// 10. ENTRADAS POR PULLBACK
+//====================================================
+
+// Direção principal da tendência.
+trendBuy = ema80 > ema200 and close > ema200 and ema9 > ema21
+trendSell = ema80 < ema200 and close < ema200 and ema9 < ema21
+
+// Correção até EMA 21 ou Wave 34.
+pullbackBuy = (low <= ema21 or low <= waveHigh) and close > ema21 and close > open
+pullbackSell = (high >= ema21 or high >= waveLow) and close < ema21 and close < open
+
+// Confirmação da Wave.
+waveBuyOK = waveBull
+waveSellOK = waveBear
+
+// Filtros completos.
+buyFiltersOK = sessionOK and canTradeToday and notSideways and macdBuy and adxBuy and waveBuyOK
+sellFiltersOK = sessionOK and canTradeToday and notSideways and macdSell and adxSell and waveSellOK
+
+// Entrada somente quando não existe posição aberta.
+buySignal = allowLong and strategy.position_size == 0 and trendBuy and pullbackBuy and buyFiltersOK
+sellSignal = allowShort and strategy.position_size == 0 and trendSell and pullbackSell and sellFiltersOK
+
+if buySignal
+    strategy.entry("LONG", strategy.long, qty=tradeQty)
+    tradesToday += 1
+
+if sellSignal
+    strategy.entry("SHORT", strategy.short, qty=tradeQty)
+    tradesToday += 1
+
+//====================================================
+// 11. SAÍDA TÉCNICA PELA EMA 80
+//====================================================
+
+useEmaExit = input.bool(true, "Fechar por perda da EMA 80", group=groupRisk)
+
+if useEmaExit and strategy.position_size > 0 and close < ema80
+    strategy.close("LONG", comment="Saída EMA 80")
+
+if useEmaExit and strategy.position_size < 0 and close > ema80
+    strategy.close("SHORT", comment="Saída EMA 80")
+
+//====================================================
+// 12. VISUALIZAÇÃO
+//====================================================
+
+plot(ema9, "EMA 9", color=color.yellow, linewidth=1)
+plot(ema21, "EMA 21", color=color.orange, linewidth=1)
+plot(ema80, "EMA 80", color=color.aqua, linewidth=2)
+plot(ema200, "EMA 200", color=color.purple, linewidth=2)
+
+pWaveHigh = plot(waveHigh, "Wave High", color=color.new(color.green, 35))
+pWaveLow = plot(waveLow, "Wave Low", color=color.new(color.red, 35))
+plot(waveClose, "Wave 34", color=color.white, linewidth=2)
+
+fill(pWaveHigh, pWaveLow, color=waveBull ? color.new(color.green, 88) : color.new(color.red, 88), title="Wave")
+
+plot(strategy.position_size > 0 ? longStop : na, "Stop Compra", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size > 0 ? longTarget : na, "Alvo Compra", color=color.green, linewidth=2, style=plot.style_linebr)
+
+plot(strategy.position_size < 0 ? shortStop : na, "Stop Venda", color=color.red, linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? shortTarget : na, "Alvo Venda", color=color.green, linewidth=2, style=plot.style_linebr)
+
+// Marcações das entradas.
+plotshape(buySignal, title="Sinal Compra", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="BUY")
+plotshape(sellSignal, title="Sinal Venda", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="SELL")
+
+// Fundo mostra a direção principal.
+bgcolor(trendBuy ? color.new(color.green, 94) : trendSell ? color.new(color.red, 94) : na)
+
+//====================================================
+// 13. ALERTAS
+//====================================================
+
+alertcondition(buySignal, title="Forex Pro V3 - Compra", message="Forex Pro V3: sinal de COMPRA por pullback.")
+alertcondition(sellSignal, title="Forex Pro V3 - Venda", message="Forex Pro V3: sinal de VENDA por pullback.")
